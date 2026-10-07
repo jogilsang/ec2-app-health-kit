@@ -1,0 +1,26 @@
+[project]
+name = "asc-kit"
+version = "0.1.0"
+description = "Attach EC2 application status checks to Auto Scaling groups and clean up safely"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "jogilsang", email = "jogilsang@naver.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "boto3[crt]>=1.43.108",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.24,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+asc-kit = "asc_kit.cli:main"

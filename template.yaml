@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ec2-app-health-kit - EC2 application status check that is actually attached to your
+  Auto Scaling groups. CloudFormation can create AWS::EC2::ApplicationStatusCheck but has no
+  resource to associate it, so a small custom resource does the association on create and
+  removes it on delete. Includes a fleet alarm on the per-check CloudWatch metric.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Targets }
+        Parameters: [TargetTagKey, TargetTagValues]
+      - Label: { default: Health check }
+        Parameters: [Protocol, Port, Path, StatusCodeMatcher, TimeoutSeconds, FailureThreshold, SuccessThreshold, GracePeriodSeconds]
+      - Label: { default: Notification }
+        Parameters: [AlarmEmail]
+
+Parameters:
+  TargetTagKey:
+    Type: String
+    Default: aws:autoscaling:groupName
+    Description: Instance tag key to match. The default targets Auto Scaling groups by name.
+  TargetTagValues:
+    Type: CommaDelimitedList
+    Description: One or more tag values (for the default key, Auto Scaling group names). Max 50.
+  Protocol:
+    Type: String
+    Default: http
+    AllowedValues: [http, https]
+  Port:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 65535
+  Path:
+    Type: String
+    Default: /health
+    AllowedPattern: "^/.*"
+  StatusCodeMatcher:
+    Type: String
+    Default: "200"
+    Description: Comma-separated codes or ranges, for example 200,204 or 200-299.
+  TimeoutSeconds:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 30
+  FailureThreshold:
+    Type: Number
+    Default: 2
+    MinValue: 1
+  SuccessThreshold:
+    Type: Number
+    Default: 2
+    MinValue: 1
+  GracePeriodSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 1
+    MaxValue: 600
+    Description: Seconds after launch before checks start. Set it longer than your app boot time.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional. Email for alarm notifications (confirm the SNS subscription mail).
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  Check:
+    Type: AWS::EC2::ApplicationStatusCheck
+    Properties:
+      Protocol: !Ref Protocol
+      Port: !Ref Port
+      Path: !Ref Path
+      StatusCodeMatcher: !Ref StatusCodeMatcher
+      Timeout: !Ref TimeoutSeconds
+      FailureThreshold: !Ref FailureThreshold
+      SuccessThreshold: !Ref SuccessThreshold
+      InitializationGracePeriodSeconds: !Ref GracePeriodSeconds
+      Aggregation: included
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  AssociatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: associate-application-status-check
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:AssociateApplicationStatusCheck
+                  - ec2:DisassociateApplicationStatusCheck
+                  - ec2:DescribeApplicationStatusChecks
+                Resource: "*"
+
+  AssociatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: ec2-app-health-kit - associate an application status check with instance tags
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 120
+      Role: !GetAtt AssociatorRole.Arn
+      Code:
+        ZipFile: |
+          # Custom resource: associate/disassociate an EC2 application status check with instance tags.
+          # Properties: CheckId, TagKey, TagValues (list). Kept dependency-free (no cfnresponse, no layer).
+          import json
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+          from botocore.exceptions import ClientError
+
+          MAX_TAG_ASSOCIATIONS = 50
+          IGNORABLE = ("NotFound", "NotAssociated", "InvalidAssociation", "does not exist", "not associated")
+
+
+          class QueryEc2:
+              """Minimal signed EC2 Query API client for the two calls we need.
+
+              The boto3 bundled in the Lambda Python runtime can lag new EC2 APIs (python3.13 had
+              boto3 1.42.97 without application status checks), so fall back to raw signed requests.
+              """
+
+              def __init__(self, session, region, endpoint):
+                  self.creds = session.get_credentials().get_frozen_credentials()
+                  self.region, self.endpoint = region, endpoint
+
+              def _call(self, action, check_id, pairs):
+                  params = {"Action": action, "Version": "2016-11-15", "ApplicationStatusCheckId": check_id}
+                  for i, p in enumerate(pairs, 1):
+                      params[f"TargetTagAssociation.{i}.Key"] = p["Key"]
+                      params[f"TargetTagAssociation.{i}.Value"] = p["Value"]
+                  req = AWSRequest(method="POST", url=self.endpoint, data=urllib.parse.urlencode(params),
+                                   headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"})
+                  SigV4Auth(self.creds, "ec2", self.region).add_auth(req)
+                  http = urllib.request.Request(self.endpoint, data=req.body.encode() if isinstance(req.body, str) else req.body,
+                                                headers=dict(req.headers.items()), method="POST")
+                  try:
+                      with urllib.request.urlopen(http, timeout=30) as r:
+                          root = ET.fromstring(r.read())
+                  except urllib.error.HTTPError as e:
+                      root = ET.fromstring(e.read())
+                      code = root.findtext(".//Code") or str(e.code)
+                      raise ClientError({"Error": {"Code": code, "Message": root.findtext(".//Message") or ""}}, action)
+                  ns = lambda t: "{*}" + t  # noqa: E731
+                  failed = [{"AssociationValue": it.findtext(ns("associationValue")), "Reason": it.findtext(ns("reason"))}
+                            for it in root.iter(ns("item")) if it.find(ns("reason")) is not None]
+                  return {"UnsuccessfulResults": failed}
+
+              def associate_application_status_check(self, ApplicationStatusCheckId, TargetTagAssociations):
+                  return self._call("AssociateApplicationStatusCheck", ApplicationStatusCheckId, TargetTagAssociations)
+
+              def disassociate_application_status_check(self, ApplicationStatusCheckId, TargetTagAssociations):
+                  return self._call("DisassociateApplicationStatusCheck", ApplicationStatusCheckId, TargetTagAssociations)
+
+
+          def make_client():
+              ec2 = boto3.client("ec2")
+              if hasattr(ec2, "associate_application_status_check"):
+                  return ec2
+              print(f"boto3 {boto3.__version__} has no application status check API; using signed Query API")
+              return QueryEc2(boto3.session.Session(), ec2.meta.region_name, ec2.meta.endpoint_url)
+
+
+          def _pairs(key, values):
+              return [{"Key": key, "Value": v} for v in values]
+
+
+          def _clean(values):
+              out = []
+              for v in values or []:
+                  v = str(v).strip()
+                  if v and v not in out:
+                      out.append(v)
+              return out
+
+
+          def _failures(resp, ignore_missing):
+              # These APIs report per-target failures in the body instead of raising.
+              bad = resp.get("UnsuccessfulResults") or []
+              if ignore_missing:
+                  bad = [b for b in bad if not any(s in (b.get("Reason") or "") for s in IGNORABLE)]
+              return bad
+
+
+          def _associate(ec2, check_id, key, values):
+              if not values:
+                  return
+              if len(values) > MAX_TAG_ASSOCIATIONS:
+                  raise ValueError(f"At most {MAX_TAG_ASSOCIATIONS} tag values per check, got {len(values)}")
+              resp = ec2.associate_application_status_check(
+                  ApplicationStatusCheckId=check_id, TargetTagAssociations=_pairs(key, values))
+              bad = _failures(resp, ignore_missing=False)
+              if bad:
+                  raise RuntimeError(f"Association failed: {bad}")
+
+
+          def _disassociate(ec2, check_id, key, values):
+              if not values:
+                  return
+              try:
+                  resp = ec2.disassociate_application_status_check(
+                      ApplicationStatusCheckId=check_id, TargetTagAssociations=_pairs(key, values))
+              except ClientError as e:
+                  if any(s in e.response["Error"]["Code"] for s in IGNORABLE):
+                      return
+                  raise
+              bad = _failures(resp, ignore_missing=True)
+              if bad:
+                  raise RuntimeError(f"Disassociation failed: {bad}")
+
+
+          def apply(get_client, event):
+              """Run the change for one custom resource event. Returns the physical resource id.
+
+              get_client is called only when an API call is needed, so a Delete for a resource that
+              never got created always succeeds and the stack can roll back cleanly.
+              """
+              props = event["ResourceProperties"]
+              check_id, key = props["CheckId"], props["TagKey"]
+              values = _clean(props.get("TagValues"))
+              physical_id = f"{check_id}|{key}"
+              request = event["RequestType"]
+
+              if request == "Create":
+                  _associate(get_client(), check_id, key, values)
+                  return physical_id
+
+              if request == "Update":
+                  old = event.get("OldResourceProperties", {})
+                  if old.get("CheckId") != check_id or old.get("TagKey") != key:
+                      # New physical id: CloudFormation sends Delete for the old one afterwards.
+                      _associate(get_client(), check_id, key, values)
+                      return physical_id
+                  old_values = _clean(old.get("TagValues"))
+                  removed = [v for v in old_values if v not in values]
+                  added = [v for v in values if v not in old_values]
+                  if removed or added:
+                      ec2 = get_client()
+                      _disassociate(ec2, check_id, key, removed)
+                      _associate(ec2, check_id, key, added)
+                  return physical_id
+
+              # Delete. A failed Create leaves a log-stream name as the physical id: nothing to undo.
+              current = event.get("PhysicalResourceId", "")
+              if current == physical_id:
+                  _disassociate(get_client(), check_id, key, values)
+              return current or physical_id
+
+
+          def _send(event, context, status, physical_id, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": (reason or f"See CloudWatch Logs: {context.log_stream_name}")[:1000],
+                  "PhysicalResourceId": physical_id or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"Content-Type": ""})
+              urllib.request.urlopen(req, timeout=30)
+
+
+          def handler(event, context):
+              print(json.dumps({k: v for k, v in event.items() if k != "ResponseURL"}))
+              physical_id = event.get("PhysicalResourceId")
+              try:
+                  physical_id = apply(make_client, event)
+                  _send(event, context, "SUCCESS", physical_id)
+              except Exception as e:  # report every failure so the stack never hangs
+                  print(f"FAILED: {e!r}")
+                  _send(event, context, "FAILED", physical_id, str(e))
+
+  Association:
+    Type: Custom::ApplicationStatusCheckAssociation
+    Properties:
+      ServiceToken: !GetAtt AssociatorFunction.Arn
+      CheckId: !GetAtt Check.ApplicationStatusCheckId
+      TagKey: !Ref TargetTagKey
+      TagValues: !Ref TargetTagValues
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasEmail
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  # One alarm for the whole fleet: each instance is a contributor, so a replaced instance
+  # simply drops out and new ones join without touching the alarm.
+  # The per-check metric is published as StatusCheckFailed_Application_<check id>_<check Name tag>
+  # (observed 2026-10; the user guide shows only the id). The check's Name tag is the stack name.
+  ImpairedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-app-impaired"
+      AlarmDescription: !Sub "Application status check ${Check.ApplicationStatusCheckId} reports impaired instances (${Protocol}:${Port}${Path})"
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: q1
+          Period: 60
+          ReturnData: true
+          Expression: !Sub >-
+            SELECT MAX("StatusCheckFailed_Application_${Check.ApplicationStatusCheckId}_${AWS::StackName}")
+            FROM SCHEMA("AWS/EC2", InstanceId) GROUP BY InstanceId ORDER BY MAX() DESC LIMIT 100
+      AlarmActions: !If [HasEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+      OKActions: !If [HasEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+Outputs:
+  ApplicationStatusCheckId:
+    Value: !GetAtt Check.ApplicationStatusCheckId
+  AlarmName:
+    Value: !Ref ImpairedAlarm
+  Note:
+    Value: >-
+      Allow the check port from inside the VPC on the instance security group (run: asc-kit preflight).
+      After deleting this stack, AWS-managed ENIs can stay for hours and block SG/subnet deletion
+      (run: asc-kit wait-eni).

@@ -1,0 +1,254 @@
+{
+ "title": "전체 구성도",
+ "subtitle": "ec2-app-health-kit - Auto Scaling 그룹에 애플리케이션 상태 확인을 붙이는 키트",
+ "legend": {
+  "primary": "배포·연결",
+  "secondary": "상태 확인·지표"
+ },
+ "layout": [
+  {
+   "dir": "col",
+   "children": [
+    {
+     "id": "ops",
+     "icon": "user",
+     "label": "운영자"
+    },
+    {
+     "id": "cli",
+     "icon": "aws-command-line-interface-aws-cli",
+     "label": "asc-kit CLI\n(scan·preflight·wait-eni)"
+    }
+   ]
+  },
+  {
+   "group": "aws-cloud",
+   "label": "AWS Cloud",
+   "dir": "row",
+   "children": [
+    {
+     "dir": "col",
+     "children": [
+      {
+       "id": "cfn",
+       "icon": "aws-cloudformation",
+       "label": "CloudFormation\n(template.yaml)"
+      },
+      {
+       "id": "fn",
+       "icon": "lambda-function",
+       "label": "Custom Resource\n(Lambda)"
+      },
+      {
+       "id": "asc",
+       "icon": "instance-with-cloudwatch",
+       "label": "Application\nStatus Check"
+      }
+     ]
+    },
+    {
+     "group": "region",
+     "label": "Region (ap-northeast-2)",
+     "children": [
+      {
+       "group": "vpc",
+       "label": "VPC",
+       "dir": "row",
+       "children": [
+        {
+         "group": "az",
+         "label": "Availability Zone A",
+         "dir": "col",
+         "children": [
+          {
+           "group": "public-subnet",
+           "label": "Subnet A",
+           "dir": "col",
+           "children": [
+            {
+             "id": "eni-a",
+             "icon": "elastic-network-interface",
+             "label": "관리형 ENI\n(AWS 소유·숨김)"
+            },
+            {
+             "id": "ec2-a",
+             "icon": "ec2",
+             "label": "EC2\nnginx /health"
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "dir": "col",
+         "children": [
+          {
+           "id": "asg",
+           "icon": "auto-scaling-2",
+           "label": "Auto Scaling\n그룹"
+          }
+         ]
+        },
+        {
+         "group": "az",
+         "label": "Availability Zone C",
+         "dir": "col",
+         "children": [
+          {
+           "group": "public-subnet",
+           "label": "Subnet C",
+           "dir": "col",
+           "children": [
+            {
+             "id": "eni-c",
+             "icon": "elastic-network-interface",
+             "label": "관리형 ENI\n(AWS 소유·숨김)"
+            },
+            {
+             "id": "ec2-c",
+             "icon": "ec2",
+             "label": "EC2\nnginx /health"
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "dir": "col",
+     "children": [
+      {
+       "id": "cw",
+       "icon": "cloudwatch",
+       "label": "CloudWatch 지표\nStatusCheckFailed_App"
+      },
+      {
+       "id": "alarm",
+       "icon": "alarm",
+       "label": "Metrics Insights\n경보 1개"
+      },
+      {
+       "id": "sns",
+       "icon": "sns",
+       "label": "SNS\n(이메일)"
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "edges": [
+  {
+   "from": "ops",
+   "to": "cfn",
+   "style": "primary",
+   "step": 1,
+   "label": "deploy"
+  },
+  {
+   "from": "cfn",
+   "to": "fn",
+   "style": "primary",
+   "step": 1
+  },
+  {
+   "from": "fn",
+   "to": "asc",
+   "style": "primary",
+   "step": 1,
+   "label": "Associate\n(태그)"
+  },
+  {
+   "from": "eni-a",
+   "to": "ec2-a",
+   "style": "secondary",
+   "step": 2,
+   "label": "60초"
+  },
+  {
+   "from": "eni-c",
+   "to": "ec2-c",
+   "style": "secondary",
+   "step": 2,
+   "badge": false
+  },
+  {
+   "from": "ec2-a",
+   "to": "asg",
+   "style": "alert",
+   "step": 3,
+   "label": "impaired"
+  },
+  {
+   "from": "asg",
+   "to": "ec2-c",
+   "style": "primary",
+   "step": 3,
+   "label": "교체",
+   "badge": false
+  },
+  {
+   "from": "ec2-c",
+   "to": "cw",
+   "style": "secondary",
+   "step": 4,
+   "label": "지표"
+  },
+  {
+   "from": "cw",
+   "to": "alarm",
+   "style": "alert",
+   "step": 4,
+   "badge": false
+  },
+  {
+   "from": "alarm",
+   "to": "sns",
+   "style": "alert",
+   "step": 4,
+   "badge": false
+  }
+ ],
+ "steps": [
+  {
+   "no": 1,
+   "title": "배포·자동 연결",
+   "desc": "스택 하나로 상태 확인을 만들고, Custom Resource 가 Auto Scaling 그룹 태그에 연결한다. CloudFormation 에는 연결 리소스가 없어서 이 부분을 키트가 채운다. Lambda 런타임 boto3 에 API 가 없으면 서명한 EC2 Query API 로 직접 호출한다."
+  },
+  {
+   "no": 2,
+   "title": "60초 HTTP 확인",
+   "desc": "서브넷·보안 그룹마다 생기는 AWS 관리형 ENI 가 각 인스턴스의 /health 를 60초마다 호출한다. 보안 그룹이 VPC 안에서 오는 포트를 막으면 전부 실패한다(preflight 로 사전 점검).",
+   "highlight": [
+    "asc"
+   ]
+  },
+  {
+   "no": 3,
+   "title": "손상 판정·교체",
+   "desc": "연속 2회 실패하면 인스턴스 앱 상태가 impaired 가 되고, ELB 없이도 Auto Scaling 그룹이 인스턴스를 교체한다(헬스 체크 유형 EC2 그대로)."
+  },
+  {
+   "no": 4,
+   "title": "경보 1개로 플릿 감시",
+   "desc": "상태 확인별 지표를 Metrics Insights 경보 1개로 묶는다. 인스턴스가 교체돼도 경보를 고칠 필요가 없다.",
+   "highlight": [
+    "asc"
+   ]
+  },
+  {
+   "no": 5,
+   "title": "점검·안전한 정리",
+   "desc": "asc-kit 이 감시 없는 그룹을 찾고(scan), 포트 허용을 확인하고(preflight), 스택 삭제 뒤 몇 시간 남는 관리형 ENI 가 회수될 때까지 기다린다(wait-eni).",
+   "highlight": [
+    "cli",
+    "asg",
+    "eni-a",
+    "eni-c"
+   ]
+  }
+ ]
+}
