@@ -107,9 +107,17 @@ Resources:
                   - ec2:DescribeApplicationStatusChecks
                 Resource: "*"
 
+  # Owned by the stack so deleting the stack also removes the logs (Lambda's default group would be left behind).
+  AssociatorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+
   AssociatorFunction:
     Type: AWS::Lambda::Function
     Properties:
+      LoggingConfig:
+        LogGroup: !Ref AssociatorLogs
       Description: ec2-app-health-kit - associate an application status check with instance tags
       Runtime: python3.13
       Handler: index.handler

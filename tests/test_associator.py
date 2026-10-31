@@ -145,3 +145,9 @@ def test_alarm_queries_the_metric_name_that_ec2_actually_publishes():
     # Observed name: StatusCheckFailed_Application_<check id>_<Name tag>; the Name tag is the stack name.
     assert "StatusCheckFailed_Application_${Check.ApplicationStatusCheckId}_${AWS::StackName}" in tpl
     assert "Value: !Ref AWS::StackName" in tpl
+
+
+def test_custom_resource_logs_are_owned_by_the_stack():
+    tpl = yaml.load((Path(__file__).parents[1] / "template.yaml").read_text(), Loader=_CfnLoader)
+    assert tpl["Resources"]["AssociatorLogs"]["Type"] == "AWS::Logs::LogGroup"
+    assert "LoggingConfig" in tpl["Resources"]["AssociatorFunction"]["Properties"]
