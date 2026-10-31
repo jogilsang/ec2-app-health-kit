@@ -21,15 +21,22 @@ The feature is good. Rolling it out across real accounts has a few rough edges, 
 
 Two `t4g.small` instances behind nothing but an Auto Scaling group (`HealthCheckType: EC2`), nginx serving `/health`.
 
-| Step | Time |
+| Step | `/health` returns 500 | nginx stopped |
+|---|---|---|
+| First failed check | +118 s | +114 s |
+| Instance `impaired` | +184 s | +163 s |
+| Kit alarm `ALARM` | (alarm fixed mid-run) | +228 s |
+| Auto Scaling marks it `Unhealthy` | +339 s | +260 s |
+| Replacement launched | +355 s | +277 s |
+| Replacement `ok` (picked up by the tag association) | +594 s | +525 s |
+| Alarm back to `OK` | +777 s | +759 s |
+
+| Lifecycle | Time |
 |---|---|
 | Stack create (check + association + alarm) | 66 s |
-| Stack create → both instances `ok` (no console steps) | 5 min 13 s (grace period 300 s) |
-| Fault injected (`/health` returns 500) → `impaired` | _see results below_ |
-| → Auto Scaling takes the instance out of service | _see results below_ |
-| → Alarm `ALARM` | _see results below_ |
-| → Replacement instance `ok`, alarm back to `OK` | _see results below_ |
-| Check deleted → managed ENIs released | about **3 h 50 min** (earlier run, 2026-10-06) |
+| Stack create → both instances `ok`, zero console steps | 5 min 13 s (grace period 300 s) |
+| Stack delete (disassociate + delete check) | 31 s |
+| Check deleted → managed ENIs released | 3 h 50 min (2026-10-06) and 56–61 min (2026-10-08): plan for 1–4 hours |
 
 ## Quick start
 
@@ -90,7 +97,7 @@ i-0fedcba987654321   impaired  asc-f5cbba98  impaired     ResponseCodeMismatch  
 aws cloudformation delete-stack --stack-name web-app-health      # disassociates, then deletes the check
 asc-kit wait-eni --vpc-id vpc-0abc...                             # only if you are also deleting the VPC/SG
 ```
-Deleting the check is quick. The managed ENIs are released by AWS later (hours in our tests). If you delete the security group or subnets in the same pipeline, wait for `wait-eni` first.
+Deleting the check is quick. The managed ENIs are released by AWS later (1 to 4 hours in our two runs). If you delete the security group or subnets in the same pipeline, wait for `wait-eni` first.
 
 ## Things worth knowing
 
